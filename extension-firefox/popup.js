@@ -2,6 +2,7 @@
  * Arena2API - Popup
  */
 (function() {
+  var chrome = (typeof browser !== 'undefined') ? browser : window.chrome;
   var $ = function(id) { return document.getElementById(id); };
 
   function update(s) {
@@ -26,7 +27,7 @@
     $('err').textContent = s.lastError || 'None';
     $('err').className = 'val ' + (s.lastError ? 'err' : 'ok');
     // V3
-    $('v3').textContent = s.v3Count || 0;
+    $('v3').textContent = (s.v3Count || 0) + (s.v3Agent !== undefined ? ' (chat ' + s.v3Chat + ' / agent ' + s.v3Agent + ')' : '');
     $('v3').className = 'val ' + (s.v3Count > 0 ? 'ok' : 'warn');
     // Auth
     if (s.hasAuth) {
@@ -42,18 +43,18 @@
   }
 
   function refresh() {
-    chrome.runtime.sendMessage({ type: 'GET_STATUS' }, function(s) {
-      if (!chrome.runtime.lastError && s) update(s);
-    });
+    chrome.runtime.sendMessage({ type: 'GET_STATUS' }).then(function(s) {
+      if (s) update(s);
+    }).catch(function(){});
   }
 
   $('save').onclick = function() {
     var url = $('url').value.trim();
     if (url) {
-      chrome.runtime.sendMessage({ type: 'SET_PROXY_URL', url: url }, function() {
+      chrome.runtime.sendMessage({ type: 'SET_PROXY_URL', url: url }).then(function() {
         $('save').textContent = 'OK!';
         setTimeout(function() { $('save').textContent = 'Save'; }, 1000);
-      });
+      }).catch(function(){});
     }
   };
 
@@ -63,23 +64,23 @@
   };
 
   $('token').onclick = function() {
-    chrome.runtime.sendMessage({ type: 'FORCE_TOKEN' }, function() {
+    chrome.runtime.sendMessage({ type: 'FORCE_TOKEN' }).then(function() {
       $('token').textContent = 'Sent!';
       setTimeout(function() { $('token').textContent = 'Get Token'; refresh(); }, 1500);
-    });
+    }).catch(function(){});
   };
 
   $('push').onclick = function() {
-    chrome.runtime.sendMessage({ type: 'FORCE_PUSH' }, function() {
+    chrome.runtime.sendMessage({ type: 'FORCE_PUSH' }).then(function() {
       $('push').textContent = 'OK!';
       setTimeout(function() { $('push').textContent = 'Push'; refresh(); }, 1000);
-    });
+    }).catch(function(){});
   };
 
   // Init
-  chrome.storage.local.get(['proxyUrl'], function(r) {
-    $('url').value = r.proxyUrl || 'http://127.0.0.1:9090';
-  });
+  chrome.storage.local.get(['proxyUrl']).then(function(r) {
+    $('url').value = (r && r.proxyUrl) || 'http://127.0.0.1:9090';
+  }).catch(function(){});
   refresh();
   setInterval(refresh, 2000);
 })();

@@ -317,6 +317,23 @@
     console.log(TAG, 'Injector ready, models:', models ? models.length : 0,
                 '| sample names:', sample.join(', '),
                 '| cookies:', Object.keys(cookies).join(', '));
+
+    // اگر مدل‌ها هنوز نرسیده‌اند (RSC payload دیر می‌آید)، چند بار دیگر تلاش کن
+    if (!models || models.length === 0) {
+      var tries = 0;
+      var t = setInterval(function() {
+        tries++;
+        var m = extractModels();
+        if (m && m.length > 0) {
+          clearInterval(t);
+          console.log(TAG, 'Models found on retry #' + tries + ':', m.length);
+          window.postMessage({ from: 'arena2api-injector', type: 'MODELS_UPDATE', models: m }, '*');
+        } else if (tries >= 10) {
+          clearInterval(t);
+          console.warn(TAG, 'Models still not found after retries (Agent Mode does not need them)');
+        }
+      }, 3000);
+    }
   }, 1000);
 
 })();

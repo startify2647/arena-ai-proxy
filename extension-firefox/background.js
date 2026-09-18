@@ -2,12 +2,16 @@
  * Arena AI Proxy - Background Script (Firefox, Manifest V2)
  *
  * مدیریت استخر توکن و کوکی‌ها و ارسال منظم به سرور پراکسی محلی
+ *
+ * نکته‌ی مهم فایرفاکس: فضای نام browser.* «پرامیس‌محور» است و callback
+ * قبول نمی‌کند (پاس دادن تابع به‌عنوان آرگومان سوم sendMessage یا
+ * آرگومان دوم storage.get خطای TypeError می‌دهد). به همین دلیل همه‌ی
+ * فراخوانی‌ها در این فایل با async/await نوشته شده‌اند.
  */
 (function() {
   'use strict';
 
   var TAG = '[Arena AI Proxy]';
-  // در فایرفاکس browser.* (پرامیس‌محور) وجود دارد و chrome.* هم سازگار است
   var api = typeof browser !== 'undefined' ? browser : chrome;
 
   // ========== وضعیت ==========
@@ -29,22 +33,28 @@
     tabId: null,
   };
 
-  // ========== گرفتن کوکی‌ها از صفحه ==========
-  async function requestPageCookies() {
-    if (!state.tabId) return null;
+  // ========== پیام به تب (پرامیس‌محور) ==========
+  async function sendToTab(msg) {
+    if (!state.tabId) {
+      try {
+        var tabs = await api.tabs.query({ url: 'https://arena.ai/*' });
+        if (tabs.length > 0) state.tabId = tabs[0].id;
+        else return null;
+      } catch(e) { return null; }
+    }
     try {
-      return await new Promise(function(resolve) {
-        api.tabs.sendMessage(state.tabId, { type: 'NEED_COOKIES' }, function(resp) {
-          if (api.runtime.lastError || !resp || !resp.cookies) {
-            resolve(null);
-          } else {
-            resolve(resp.cookies);
-          }
-        });
-      });
+      return await api.tabs.sendMessage(state.tabId, msg);
     } catch(e) {
+      // تب بسته شده یا content script لود نشده
+      state.tabId = null;
       return null;
     }
+  }
+
+  // ========== گرفتن کوکی‌ها از صفحه ==========
+  async function requestPageCookies() {
+    var resp = await sendToTab({ type: 'NEED_COOKIES' });
+    return (resp && resp.cookies) ? resp.cookies : null;
   }
 
   // ========== تازه‌سازی کوکی‌ها ==========
@@ -80,12 +90,6 @@
         }
       }
       state.authToken = auth;
-
-      if (auth) {
-        console.log(TAG, 'Auth Cookie found! Length:', auth.length);
-      } else {
-        console.log(TAG, 'Auth Cookie NOT found. Available cookies:', Object.keys(state.cookies));
-      }
     } catch(e) {
       console.error(TAG, 'Cookie error:', e);
     }
@@ -97,7 +101,7 @@
     if (state.v3Tokens.some(function(t) { return t.token === token; })) return;
     state.v3Tokens.push({ token: token, action: action || 'chat_submit', ts: Date.now() });
     while (state.v3Tokens.length > 10) state.v3Tokens.shift();
-    console.log(TAG, 'Token added, pool:', state.v3Tokens.length);
+    console.log(TAG, 'Token added (' + (action || 'chat_submit') + '), pool:', state.v3Tokens.length);
   }
 
   function cleanTokens() {
@@ -105,40 +109,46 @@
     state.v3Tokens = state.v3Tokens.filter(function(t) { return now - t.ts < 110000; });
   }
 
+  function countAction(action) {
+    return state.v3Tokens.filter(function(t) { return t.action === action; }).length;
+  }
+
   // ========== درخواست توکن از content script ==========
-  // action می‌تواند 'chat_submit' (حالت مستقیم) یا
-  // 'agentic_chat_submit' (حالت ایجنت) باشد.
+  // action: 'chat_submit' (حالت مستقیم) یا 'agentic_chat_submit' (حالت ایجنت)
+  var tokenInFlight = {};
   async function requestToken(action) {
     action = action || 'chat_submit';
-    if (!state.tabId) {
-      try {
-        var tabs = await api.tabs.query({ url: 'https://arena.ai/*' });
-        if (tabs.length > 0) state.tabId = tabs[0].id;
-        else return;
-      } catch(e) { return; }
-    }
+    if (tokenInFlight[action]) return;
+    tokenInFlight[action] = true;
     try {
-      api.tabs.sendMessage(state.tabId, {
-        type: 'NEED_TOKEN',
-        action: action,
-      }, function(resp) {
-        if (api.runtime.lastError) {
-          state.tabId = null;
-          return;
-        }
-        if (resp && resp.token) {
-          addToken(resp.token, resp.action);
-          pushToServer();
-        }
-      });
-    } catch(e) {
-      state.tabId = null;
+      var resp = await sendToTab({ type: 'NEED_TOKEN', action: action });
+      if (resp && resp.token) {
+        addToken(resp.token, resp.action || action);
+        await pushToServer();
+      } else if (resp && resp.error) {
+        console.warn(TAG, 'Token request failed:', resp.error);
+      }
+    } finally {
+      tokenInFlight[action] = false;
     }
   }
 
+  // ========== درخواست مجدد مدل‌ها از صفحه ==========
+  async function requestModels() {
+    var resp = await sendToTab({ type: 'NEED_MODELS' });
+    if (resp && resp.models && resp.models.length > 0) {
+      state.models = resp.models;
+      console.log(TAG, 'Models received (retry):', resp.models.length);
+      return true;
+    }
+    return false;
+  }
+
   // ========== ارسال به سرور ==========
+  var pushing = false;
   async function pushToServer() {
-    if (!state.proxyUrl) return;
+    if (!state.proxyUrl || pushing) return;
+    pushing = true;
     try {
       await refreshCookies();
       cleanTokens();
@@ -147,6 +157,7 @@
         cookies: state.cookies,
         auth_token: state.authToken,
         cf_clearance: state.cfClearance,
+        user_agent: navigator.userAgent,
         v3_tokens: state.v3Tokens.map(function(t) {
           return { token: t.token, action: t.action, age_ms: Date.now() - t.ts };
         }),
@@ -169,6 +180,7 @@
         state.lastError = '';
         state.lastPush = Date.now();
         var result = await resp.json();
+        pushing = false;
         if (result.need_tokens) {
           requestToken('chat_submit');
         }
@@ -182,18 +194,20 @@
     } catch(e) {
       state.connected = false;
       state.lastError = e.message || 'Connection failed';
+    } finally {
+      pushing = false;
     }
   }
 
   // ========== پردازش پیام‌ها ==========
-  api.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
+  // در فایرفاکس اگر listener یک Promise برگرداند، مقدار resolve شده پاسخ است.
+  api.runtime.onMessage.addListener(function(msg, sender) {
     switch (msg.type) {
       case 'TAB_READY':
         state.tabId = sender.tab ? sender.tab.id : null;
         console.log(TAG, 'Tab ready:', state.tabId);
-        refreshCookies().then(function() { pushToServer(); });
-        sendResponse({ ok: true });
-        break;
+        pushToServer();
+        return Promise.resolve({ ok: true });
 
       case 'PAGE_INIT':
         if (msg.models && msg.models.length > 0) {
@@ -202,100 +216,105 @@
         }
         if (msg.pageCookies) {
           for (var k in msg.pageCookies) {
-            if (!state.cookies[k]) {
-              state.cookies[k] = msg.pageCookies[k];
-            }
-          }
-          var auth = state.cookies['arena-auth-prod-v1'] || '';
-          if (!auth) {
-            var p0 = state.cookies['arena-auth-prod-v1.0'] || '';
-            var p1 = state.cookies['arena-auth-prod-v1.1'] || '';
-            if (p0) {
-              auth = p0 + (p1 || '');
-              state.authToken = auth;
-              console.log(TAG, 'Auth token updated from page cookies! Length:', auth.length);
-            }
+            if (!state.cookies[k]) state.cookies[k] = msg.pageCookies[k];
           }
         }
         pushToServer();
-        sendResponse({ ok: true });
-        break;
+        return Promise.resolve({ ok: true });
+
+      case 'MODELS_UPDATE':
+        if (msg.models && msg.models.length > 0) {
+          state.models = msg.models;
+          console.log(TAG, 'Models updated:', msg.models.length);
+          pushToServer();
+        }
+        return Promise.resolve({ ok: true });
 
       case 'NEW_TOKEN':
         addToken(msg.token, msg.action);
         pushToServer();
-        sendResponse({ ok: true });
-        break;
+        return Promise.resolve({ ok: true });
 
       case 'GET_STATUS':
         cleanTokens();
-        refreshCookies().then(function() {
-          sendResponse({
+        return refreshCookies().then(function() {
+          return {
             connected: state.connected,
             proxyUrl: state.proxyUrl,
             lastError: state.lastError,
             lastPush: state.lastPush,
             v3Count: state.v3Tokens.length,
+            v3Chat: countAction('chat_submit'),
+            v3Agent: countAction('agentic_chat_submit'),
             hasV2: !!state.v2Token,
             hasAuth: !!state.authToken,
             hasCf: !!state.cfClearance,
             hasModels: !!(state.models && state.models.length),
             modelCount: state.models ? state.models.length : 0,
             tabId: state.tabId,
-          });
+          };
         });
-        return true;
 
       case 'SET_PROXY_URL':
         state.proxyUrl = msg.url;
         api.storage.local.set({ proxyUrl: msg.url });
         pushToServer();
-        sendResponse({ ok: true });
-        break;
+        return Promise.resolve({ ok: true });
 
       case 'FORCE_PUSH':
         pushToServer();
-        sendResponse({ ok: true });
-        break;
+        return Promise.resolve({ ok: true });
 
       case 'FORCE_TOKEN':
-        requestToken();
-        sendResponse({ ok: true });
-        break;
+        requestToken('chat_submit');
+        setTimeout(function() { requestToken('agentic_chat_submit'); }, 2000);
+        return Promise.resolve({ ok: true });
 
       default:
-        sendResponse({ error: 'unknown' });
+        return Promise.resolve({ error: 'unknown' });
     }
   });
 
-  // تعداد توکن‌های سالم هر action
-  function countAction(action) {
-    return state.v3Tokens.filter(function(t) { return t.action === action; }).length;
-  }
-
   // ========== کارهای زمان‌بندی‌شده ==========
   // دو استخر جدا: chat_submit برای حالت مستقیم، agentic_chat_submit برای حالت ایجنت
-  setInterval(function() {
+  function topUpTokens() {
     cleanTokens();
     if (countAction('chat_submit') < 3) {
       requestToken('chat_submit');
     }
     if (countAction('agentic_chat_submit') < 2) {
-      // کمی تأخیر تا دو فراخوان reCAPTCHA پشت‌سرهم تداخل نکنند
       setTimeout(function() { requestToken('agentic_chat_submit'); }, 2000);
     }
-  }, 80000);
+  }
+  setInterval(topUpTokens, 80000);
+  // اولین پر کردن استخر کمی بعد از استارت (وقتی تب آماده شد)
+  setTimeout(topUpTokens, 8000);
 
-  setInterval(function() {
-    pushToServer();
-  }, 30000);
+  setInterval(function() { pushToServer(); }, 30000);
+
+  // اگر مدل‌ها هنوز نیامده‌اند، چند بار دیگر از صفحه بپرس
+  var modelRetries = 0;
+  var modelTimer = setInterval(async function() {
+    modelRetries++;
+    if ((state.models && state.models.length > 0) || modelRetries > 8) {
+      clearInterval(modelTimer);
+      return;
+    }
+    if (await requestModels()) {
+      clearInterval(modelTimer);
+      pushToServer();
+    }
+  }, 7000);
 
   // ========== راه‌اندازی ==========
-  api.storage.local.get(['proxyUrl'], function(result) {
-    if (result.proxyUrl) state.proxyUrl = result.proxyUrl;
+  (async function init() {
+    try {
+      var result = await api.storage.local.get(['proxyUrl']);
+      if (result && result.proxyUrl) state.proxyUrl = result.proxyUrl;
+    } catch(e) {}
     console.log(TAG, 'Proxy URL:', state.proxyUrl);
-    refreshCookies().then(function() { pushToServer(); });
-  });
+    pushToServer();
+  })();
 
   api.tabs.onRemoved.addListener(function(tabId) {
     if (tabId === state.tabId) state.tabId = null;

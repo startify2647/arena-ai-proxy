@@ -47,27 +47,33 @@
       return;
     }
 
+    if (msg.type === 'MODELS_UPDATE') {
+      api.runtime.sendMessage({ type: 'MODELS_UPDATE', models: msg.models }).catch(function(){});
+      return;
+    }
+
     if (msg.type === 'INIT') {
       console.log(TAG, 'Injector initialized, models:', msg.models ? msg.models.length : 0);
       api.runtime.sendMessage({
         type: 'PAGE_INIT',
         models: msg.models,
         pageCookies: msg.cookies,
-      });
+      }).catch(function(){});
       setTimeout(function() { fetchAndPushToken(); }, 2000);
     }
   });
 
   // ========== گرفتن توکن و ارسال به background ==========
-  function fetchAndPushToken() {
-    callInjector('GET_TOKEN', { action: 'chat_submit' }).then(function(result) {
+  function fetchAndPushToken(action) {
+    action = action || 'chat_submit';
+    callInjector('GET_TOKEN', { action: action }).then(function(result) {
       if (result.token) {
-        console.log(TAG, 'Got V3 token:', result.token.length, 'chars');
+        console.log(TAG, 'Got V3 token (' + action + '):', result.token.length, 'chars');
         api.runtime.sendMessage({
           type: 'NEW_TOKEN',
           token: result.token,
           action: result.action || 'chat_submit',
-        });
+        }).catch(function(){});
       }
     }).catch(function(err) {
       console.warn(TAG, 'Token error:', err.message);
@@ -75,47 +81,42 @@
   }
 
   // ========== گوش دادن به درخواست‌های background ==========
-  api.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
+  // در فایرفاکس، برگرداندن Promise از listener = پاسخ async (بدون sendResponse)
+  api.runtime.onMessage.addListener(function(msg) {
     if (msg.type === 'NEED_TOKEN') {
-      callInjector('GET_TOKEN', { action: msg.action || 'chat_submit' }).then(function(result) {
-        sendResponse({ token: result.token, action: result.action });
+      return callInjector('GET_TOKEN', { action: msg.action || 'chat_submit' }).then(function(result) {
+        return { token: result.token, action: result.action };
       }).catch(function(err) {
-        sendResponse({ error: err.message });
+        return { error: err.message };
       });
-      return true;
     }
 
     if (msg.type === 'NEED_MODELS') {
-      callInjector('GET_MODELS').then(function(result) {
-        sendResponse({ models: result.models });
+      return callInjector('GET_MODELS').then(function(result) {
+        return { models: result.models };
       }).catch(function(err) {
-        sendResponse({ error: err.message });
+        return { error: err.message };
       });
-      return true;
     }
 
     if (msg.type === 'NEED_COOKIES') {
-      callInjector('GET_COOKIES').then(function(result) {
-        sendResponse({ cookies: result.cookies });
+      return callInjector('GET_COOKIES').then(function(result) {
+        return { cookies: result.cookies };
       }).catch(function(err) {
-        sendResponse({ error: err.message });
+        return { error: err.message };
       });
-      return true;
     }
 
     if (msg.type === 'CHECK_PAGE') {
-      callInjector('CHECK').then(function(result) {
-        sendResponse(result);
-      }).catch(function(err) {
-        sendResponse({ error: err.message });
+      return callInjector('CHECK').catch(function(err) {
+        return { error: err.message };
       });
-      return true;
     }
   });
 
   // ========== راه‌اندازی ==========
   console.log(TAG, 'Content script loaded (Firefox)');
-  api.runtime.sendMessage({ type: 'TAB_READY' });
+  api.runtime.sendMessage({ type: 'TAB_READY' }).catch(function(){});
 
   var checkCount = 0;
   var checker = setInterval(function() {
@@ -127,8 +128,9 @@
     callInjector('CHECK').then(function(result) {
       if (result.recaptcha) {
         clearInterval(checker);
-        console.log(TAG, 'reCAPTCHA ready, fetching token');
-        fetchAndPushToken();
+        console.log(TAG, 'reCAPTCHA ready, fetching tokens');
+        fetchAndPushToken('chat_submit');
+        setTimeout(function() { fetchAndPushToken('agentic_chat_submit'); }, 2500);
       }
     }).catch(function() {});
   }, 2000);

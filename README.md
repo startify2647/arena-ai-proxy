@@ -164,7 +164,22 @@ curl http://localhost:9090/v1/chat/completions \
   `API_KEY=mysecret python server.py` و سپس همان کلید را در ایجنت بگذارید)
 - **Model:** یکی از نام‌های `/v1/models` (مثل `gpt-5-chat`)
 
-### Hermes (Nous) / هر کلاینت SDK
+### Hermes Agent (Nous)
+در `~/.hermes/config.yaml` (یا با `hermes config edit`):
+```yaml
+model:
+  provider: custom
+  default: agent                       # یا نام هر مدل از /v1/models
+  base_url: http://127.0.0.1:9090/v1   # حتماً با /v1
+  api_key: dummy                       # خالی نباشد
+  context_length: 128000
+```
+سپس: `hermes config check` و تست: `hermes chat -q "سلام" -Q`
+- `/v1` را جا نیندازید؛ بدون آن هرمس به `/chat/completions` می‌زند (404).
+- به‌جای `model_aliases` از کلیدهای سراسری بالا استفاده کنید (باگ شناخته‌شده‌ی هرمس).
+- اگر هرمس داخل Docker/WSL است، به‌جای `127.0.0.1` آی‌پی هاست (مثل `172.17.0.1`) را بگذارید.
+
+### هر کلاینت SDK پایتون
 ```python
 from openai import OpenAI
 
@@ -250,6 +265,15 @@ arena2api/
 | پاسخ خطا/خالی از arena | توکن تمام شده یا کوکی منقضی | چند ثانیه صبر کنید؛ پاپ‌آپ → Get Token؛ در سایت دوباره لاگین کنید |
 | Auth Cookie = No | لاگین نیستید یا کوکی عوض شده | در arena.ai لاگین کنید و تب را رفرش کنید |
 | در Console `models: 0` | ساختار سایت دوباره عوض شده | وصله نیاز به به‌روزرسانی دارد — گزارش دهید |
+| `503 No reCAPTCHA token available` | افزونه توکن نمی‌سازد | Console تب arena.ai را ببینید؛ باید `Got V3 token` چاپ شود. AdBlock/Shields را برای arena.ai خاموش کنید |
+| **(Firefox)** `Permission denied to access object` + `Injector timeout` | نسخه‌ی قدیمی افزونه (< 2.0.2) | افزونه را به‌روز و در `about:debugging` ریلود کنید، تب را دوباره باز کنید |
+| `403 Attention Required! Cloudflare` | درخواست بدون توکن، یا UA/کوکی ناهماهنگ | ابتدا توکن‌ها را درست کنید؛ سرور از نسخه‌ی 2.0.2 به بعد UA مرورگر را خودکار کپی می‌کند |
+
+**بررسی سریع وضعیت سرور:**
+```bash
+curl -s http://127.0.0.1:9090/v1/extension/status | python3 -m json.tool
+```
+`v3_chat_tokens` (حالت مستقیم) و `v3_agent_tokens` (حالت agent) باید بزرگ‌تر از ۰ باشند.
 
 **دیباگ:** در صفحه‌ی arena.ai کلید F12 → Console. باید ببینید:
 ```

@@ -151,6 +151,7 @@
         cookies: state.cookies,
         auth_token: state.authToken,
         cf_clearance: state.cfClearance,
+        user_agent: navigator.userAgent,
         v3_tokens: state.v3Tokens.map(function(t) {
           return { token: t.token, action: t.action, age_ms: Date.now() - t.ts };
         }),

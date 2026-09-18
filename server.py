@@ -80,6 +80,7 @@ class Store:
         self.cookies: dict = {}
         self.auth_token: str = ""
         self.cf_clearance: str = ""
+        self.user_agent: str = ""   # UA مرورگر — باید با کوکی cf_clearance یکی باشد
         self.v3_tokens: list = []  # [{token, action, ts}]
         self.v2_token: Optional[dict] = None
         self.last_push: float = 0
@@ -101,6 +102,8 @@ class Store:
             self.auth_token = data["auth_token"]
         if data.get("cf_clearance"):
             self.cf_clearance = data["cf_clearance"]
+        if data.get("user_agent"):
+            self.user_agent = str(data["user_agent"])[:300]
         # V3 tokens
         if data.get("v3_tokens"):
             for t in data["v3_tokens"]:
@@ -204,6 +207,7 @@ class Store:
             "has_v2": bool(self.v2_token and now - self.v2_token["ts"] < 120),
             "has_auth": bool(self.auth_token),
             "has_cf": bool(self.cf_clearance),
+            "user_agent": self.user_agent or None,
             "text_models": len(self.text_models),
             "image_models": len(self.image_models),
             "next_actions": list(self.next_actions.keys()),
@@ -227,8 +231,13 @@ store = Store()
 #                  پایان نوبت: chunk.type == "trigger:turn-complete"
 # ============================================================
 
-USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+DEFAULT_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+
+def current_user_agent() -> str:
+    """UA همان مرورگری که اکستنشن در آن است — Cloudflare کوکی cf_clearance را به UA قفل می‌کند"""
+    return store.user_agent or DEFAULT_USER_AGENT
 
 _UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
@@ -333,7 +342,7 @@ def _agent_headers(sid: Optional[str] = None, pat: Optional[str] = None,
     h = {
         "origin": ARENA_BASE,
         "referer": f"{ARENA_BASE}/agent/{sid}" if sid else f"{ARENA_BASE}/",
-        "user-agent": USER_AGENT,
+        "user-agent": current_user_agent(),
         "cookie": store.build_cookie_header(),
     }
     if sse:
@@ -915,7 +924,12 @@ async def chat_completions(request: Request):
     elif v3_token:
         arena_payload["recaptchaV3Token"] = v3_token
     else:
-        log.warning("No reCAPTCHA token available, sending without token")
+        # بدون توکن، arena/Cloudflare قطعاً 403 می‌دهد؛ بهتر است صریح 503 برگردانیم
+        log.warning("No reCAPTCHA token available (chat_submit); refusing request")
+        raise HTTPException(
+            503,
+            "No reCAPTCHA token available. Keep the arena.ai tab open (logged in) "
+            "and retry in a few seconds. Check /v1/extension/status → v3_chat_tokens.")
 
     # 构建 headers
     headers = {
@@ -923,7 +937,7 @@ async def chat_completions(request: Request):
         "content-type": "application/json",
         "origin": ARENA_BASE,
         "referer": f"{ARENA_BASE}/?mode=direct",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "user-agent": current_user_agent(),
         "cookie": store.build_cookie_header(),
     }
 
