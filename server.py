@@ -58,7 +58,8 @@ AGENT_TURN_TIMEOUT = float(os.environ.get("AGENT_TURN_TIMEOUT", "600"))  # مه�
 AGENT_STALL_TIMEOUT = float(os.environ.get("AGENT_STALL_TIMEOUT", "120"))  # مهلت سکون استریم
 
 # reCAPTCHA
-RECAPTCHA_V3_SITEKEY = "6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I"
+# فقط جهت مستندسازی — افزونه سایت‌کی را خودکار از صفحه تشخیص می‌دهد
+RECAPTCHA_V3_SITEKEY = "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0"  # قبلی: 6Led_uYr...
 
 # ============================================================
 # UUIDv7

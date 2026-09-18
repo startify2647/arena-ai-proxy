@@ -20,7 +20,29 @@
 (function() {
   'use strict';
 
-  var SITEKEY = '6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I';
+
+  // ========== تشخیص خودکار سایت‌کی ==========
+  // arena.ai سایت‌کی را گاهی عوض می‌کند؛ آن را از خود صفحه می‌خوانیم:
+  //  ۱) iframe انکر reCAPTCHA (پارامتر k=)  ۲) اسکریپت api.js/enterprise.js (render=)
+  //  ۳) در نهایت مقدار پیش‌فرض
+  var DEFAULT_SITEKEY = '6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0';
+  var LEGACY_SITEKEY  = '6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I';
+  function detectSiteKey() {
+    try {
+      var iframes = document.querySelectorAll('iframe[src*="recaptcha"]');
+      for (var i = 0; i < iframes.length; i++) {
+        var m = /[?&]k=([A-Za-z0-9_-]{30,50})/.exec(iframes[i].src || '');
+        if (m) return m[1];
+      }
+      var scripts = document.querySelectorAll('script[src*="recaptcha"]');
+      for (var s = 0; s < scripts.length; s++) {
+        var m2 = /[?&]render=([A-Za-z0-9_-]{30,50})/.exec(scripts[s].src || '');
+        if (m2 && m2[1] !== 'explicit') return m2[1];
+      }
+    } catch(e) {}
+    return DEFAULT_SITEKEY;
+  }
+  function getSiteKey() { return detectSiteKey(); }
   var TAG = '[Arena2API]';
 
   // پنجره‌ی واقعی صفحه — در فایرفاکس از Xray عبور می‌کند
@@ -187,7 +209,21 @@
       var act = action || 'chat_submit';
       var done = false;
       function ok(t)  { if (!done) { done = true; resolve(t); } }
-      function bad(e) { if (!done) { done = true; reject(e instanceof Error ? e : new Error(String(e))); } }
+      var triedLegacy = false;
+      function bad(e) {
+        if (done) return;
+        // اگر کی تشخیص‌داده‌شده رد شد، یک بار با کی قدیمی امتحان کن
+        if (!triedLegacy && /site key/i.test(String(e)) && getSiteKey() !== LEGACY_SITEKEY) {
+          triedLegacy = true;
+          try {
+            var o2 = isXray ? cloneInto({ action: act }, PW) : { action: act };
+            var p2 = g.execute(LEGACY_SITEKEY, o2);
+            if (isXray) p2.then(exportFunction(ok, PW), exportFunction(bad, PW)); else p2.then(ok, bad);
+            return;
+          } catch (e2) { e = e2; }
+        }
+        done = true; reject(e instanceof Error ? e : new Error(String(e)));
+      }
 
       // [FIREFOX] هر تابع/آبجکتی که به کد صفحه پاس می‌دهیم باید با
       // exportFunction / cloneInto صادر شود؛ وگرنه صفحه هنگام صدا زدن آن
@@ -197,7 +233,7 @@
       function runExecute() {
         try {
           var opts = isXray ? cloneInto({ action: act }, PW) : { action: act };
-          var p = g.execute(SITEKEY, opts);
+          var p = g.execute(getSiteKey(), opts);
           if (isXray) {
             p.then(exportFunction(ok, PW), exportFunction(bad, PW));
           } else {
@@ -314,6 +350,7 @@
     }, '*');
     var sample = models ? models.filter(function(m){ return m && m.publicName; })
                                .slice(0, 5).map(function(m){ return m.publicName; }) : [];
+    console.log(TAG, 'sitekey:', detectSiteKey());
     console.log(TAG, 'Injector ready, models:', models ? models.length : 0,
                 '| sample names:', sample.join(', '),
                 '| cookies:', Object.keys(cookies).join(', '));

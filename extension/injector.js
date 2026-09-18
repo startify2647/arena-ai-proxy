@@ -18,7 +18,29 @@
 (function() {
   'use strict';
 
-  var SITEKEY = '6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I';
+
+  // ========== تشخیص خودکار سایت‌کی ==========
+  // arena.ai سایت‌کی را گاهی عوض می‌کند؛ آن را از خود صفحه می‌خوانیم:
+  //  ۱) iframe انکر reCAPTCHA (پارامتر k=)  ۲) اسکریپت api.js/enterprise.js (render=)
+  //  ۳) در نهایت مقدار پیش‌فرض
+  var DEFAULT_SITEKEY = '6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0';
+  var LEGACY_SITEKEY  = '6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I';
+  function detectSiteKey() {
+    try {
+      var iframes = document.querySelectorAll('iframe[src*="recaptcha"]');
+      for (var i = 0; i < iframes.length; i++) {
+        var m = /[?&]k=([A-Za-z0-9_-]{30,50})/.exec(iframes[i].src || '');
+        if (m) return m[1];
+      }
+      var scripts = document.querySelectorAll('script[src*="recaptcha"]');
+      for (var s = 0; s < scripts.length; s++) {
+        var m2 = /[?&]render=([A-Za-z0-9_-]{30,50})/.exec(scripts[s].src || '');
+        if (m2 && m2[1] !== 'explicit') return m2[1];
+      }
+    } catch(e) {}
+    return DEFAULT_SITEKEY;
+  }
+  function getSiteKey() { return detectSiteKey(); }
   var TAG = '[Arena2API]';
   var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -180,9 +202,15 @@
       }
 
       g.ready(function() {
-        g.execute(SITEKEY, { action: action || 'chat_submit' })
+        var key = getSiteKey();
+        g.execute(key, { action: action || 'chat_submit' })
           .then(resolve)
-          .catch(reject);
+          .catch(function(err) {
+            // اگر کی تشخیص‌داده‌شده رد شد، یک بار با کی قدیمی امتحان کن
+            if (key !== LEGACY_SITEKEY && /site key/i.test(String(err))) {
+              g.execute(LEGACY_SITEKEY, { action: action || 'chat_submit' }).then(resolve).catch(reject);
+            } else reject(err);
+          });
       });
     });
   }
@@ -282,6 +310,7 @@
     }, '*');
     var sample = models ? models.filter(function(m){ return m && m.publicName; })
                                .slice(0, 5).map(function(m){ return m.publicName; }) : [];
+    console.log(TAG, 'sitekey:', detectSiteKey());
     console.log(TAG, 'Injector ready, models:', models ? models.length : 0,
                 '| sample names:', sample.join(', '),
                 '| cookies:', Object.keys(cookies).join(', '));
