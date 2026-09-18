@@ -24,6 +24,13 @@ from typing import Optional
 
 import httpx
 import uvicorn
+try:
+    # TLS fingerprint شبیه مرورگر واقعی — بدون آن Cloudflare درخواست‌های httpx را 403 می‌کند
+    from curl_cffi.requests import AsyncSession as _CurlSession
+    HAVE_CURL_CFFI = True
+except Exception:  # noqa: BLE001
+    _CurlSession = None
+    HAVE_CURL_CFFI = False
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse, JSONResponse
@@ -218,6 +225,101 @@ class Store:
 
 store = Store()
 
+
+# ============================================================
+# لایه‌ی HTTP — curl_cffi با impersonate مرورگر (در صورت نصب)، وگرنه httpx
+# ============================================================
+def _impersonate_target() -> str:
+    """بر اساس UA مرورگر کاربر، پروفایل TLS مناسب را انتخاب می‌کند"""
+    ua = (store.user_agent or "").lower()
+    if "firefox" in ua:
+        return "firefox"
+    if "safari" in ua and "chrome" not in ua:
+        return "safari"
+    return "chrome"
+
+
+class _StreamResp:
+    """پوششی حداقلی روی پاسخ استریم curl_cffi با API شبیه httpx"""
+
+    def __init__(self, r):
+        self._r = r
+        self.status_code = r.status_code
+
+    async def aread(self) -> bytes:
+        return await self._r.acontent()
+
+    async def aiter_lines(self):
+        buf = b""
+        async for chunk in self._r.aiter_content():
+            buf += chunk
+            while True:
+                i = buf.find(b"\n")
+                if i < 0:
+                    break
+                line, buf = buf[:i], buf[i + 1:]
+                yield line.rstrip(b"\r").decode("utf-8", "replace")
+        if buf:
+            yield buf.decode("utf-8", "replace")
+
+
+class _StreamCtx:
+    def __init__(self, session, method, url, **kw):
+        self.session, self.method, self.url, self.kw = session, method, url, kw
+        self._r = None
+
+    async def __aenter__(self):
+        self._r = await self.session.request(self.method, self.url, stream=True, **self.kw)
+        return _StreamResp(self._r)
+
+    async def __aexit__(self, *exc):
+        try:
+            await self._r.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class ArenaClient:
+    """کلاینت HTTP یکپارچه: post/get/stream — با TLS مرورگر اگر curl_cffi باشد"""
+
+    def __init__(self, timeout: float = 300.0, read_timeout: Optional[float] = None):
+        self.timeout = timeout
+        self.read_timeout = read_timeout or timeout
+        self._curl = None
+        self._httpx = None
+
+    async def __aenter__(self):
+        if HAVE_CURL_CFFI:
+            self._curl = _CurlSession(impersonate=_impersonate_target(),
+                                      timeout=self.timeout)
+        else:
+            t = httpx.Timeout(connect=30.0, read=self.read_timeout, write=60.0, pool=60.0)
+            self._httpx = httpx.AsyncClient(timeout=t, follow_redirects=True)
+        return self
+
+    async def __aexit__(self, *exc):
+        if self._curl is not None:
+            await self._curl.close()
+        if self._httpx is not None:
+            await self._httpx.aclose()
+
+    async def post(self, url, json=None, headers=None, **kw):
+        if self._curl is not None:
+            return await self._curl.post(url, json=json, headers=headers)
+        return await self._httpx.post(url, json=json, headers=headers, **kw)
+
+    async def get(self, url, headers=None, **kw):
+        if self._curl is not None:
+            return await self._curl.get(url, headers=headers)
+        return await self._httpx.get(url, headers=headers, **kw)
+
+    def stream(self, method, url, json=None, headers=None, timeout=None, **kw):
+        if self._curl is not None:
+            return _StreamCtx(self._curl, method, url, json=json, headers=headers,
+                              timeout=(30, self.read_timeout))
+        return self._httpx.stream(method, url, json=json, headers=headers,
+                                  timeout=timeout, **kw)
+
 # ============================================================
 # Agent Mode — گفتگوهای چندنوبتی با یک reCAPTCHA برای کل مکالمه
 # ============================================================
@@ -372,7 +474,7 @@ def _extract_session_id(text: str, our_msg_id: str) -> Optional[str]:
     return None
 
 
-async def agent_recreate(client: httpx.AsyncClient, conv: AgentConversation):
+async def agent_recreate(client, conv: AgentConversation):
     """گرفتن publicAccessToken تازه (بدون reCAPTCHA)"""
     r = await client.post(ARENA_TRIGGER_SESSION,
                           json={"sessionId": conv.session_id, "timezone": "UTC"},
@@ -389,7 +491,7 @@ async def agent_recreate(client: httpx.AsyncClient, conv: AgentConversation):
     conv.pat = pat
 
 
-async def agent_create(client: httpx.AsyncClient, seed_text: str,
+async def agent_create(client, seed_text: str,
                        model_id: Optional[str], v3_token: Optional[str],
                        v2_token: Optional[str]) -> AgentConversation:
     """ایجاد گفتگوی جدید با پیام اول (اینجاست که reCAPTCHA مصرف می‌شود)"""
@@ -420,7 +522,7 @@ async def agent_create(client: httpx.AsyncClient, seed_text: str,
     return conv
 
 
-async def agent_append(client: httpx.AsyncClient, conv: AgentConversation, text: str):
+async def agent_append(client, conv: AgentConversation, text: str):
     """ارسال پیام user بعدی روی همان سشن — بدون reCAPTCHA"""
     msg_id = uuid7()
     chunk = {
@@ -449,7 +551,7 @@ async def agent_append(client: httpx.AsyncClient, conv: AgentConversation, text:
         raise AgentError(r.status_code, f"append failed: {r.text[:300]}")
 
 
-async def agent_read_turn(client: httpx.AsyncClient, conv: AgentConversation,
+async def agent_read_turn(client, conv: AgentConversation,
                           on_delta=None) -> str:
     """خواندن پاسخ نوبت فعلی از استریم SSE تا رسیدن trigger:turn-complete.
 
@@ -529,10 +631,8 @@ async def _agent_flow(model_name: str, messages: list, on_delta=None) -> str:
     """جریان کامل یک درخواست ایجنت؛ متن پاسخ نهایی را برمی‌گرداند."""
     turns = build_agent_turns(messages)
     conv = agent_mgr.find(turns)
-    timeout = httpx.Timeout(connect=30.0, read=AGENT_STALL_TIMEOUT,
-                            write=60.0, pool=60.0)
-
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+    async with ArenaClient(timeout=AGENT_TURN_TIMEOUT,
+                           read_timeout=AGENT_STALL_TIMEOUT) as client:
         if conv is not None:
             # سریال‌سازی دسترسی به سشن مشترک
             await conv.lock.acquire()
@@ -969,7 +1069,7 @@ async def stream_response(url, payload, headers, model_name, eval_id, client_typ
     created = int(time.time())
 
     try:
-        async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
+        async with ArenaClient(timeout=300) as client:
             async with client.stream("POST", url, json=payload, headers=headers) as resp:
                 if resp.status_code != 200:
                     body = await resp.aread()
@@ -1115,7 +1215,7 @@ async def non_stream_response(url, payload, headers, model_name, eval_id, client
     usage = {}
 
     try:
-        async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
+        async with ArenaClient(timeout=300) as client:
             async with client.stream("POST", url, json=payload, headers=headers) as resp:
                 if resp.status_code != 200:
                     body = await resp.aread()
@@ -1222,5 +1322,6 @@ async def health():
 if __name__ == "__main__":
     log.info(f"Starting arena2api on port {PORT}")
     log.info(f"OpenAI API: http://localhost:{PORT}/v1")
-    log.info("Waiting for Chrome extension to connect...")
+    log.info(f"TLS impersonation (curl_cffi): {'ON' if HAVE_CURL_CFFI else 'OFF — pip install curl_cffi to avoid Cloudflare 403'}")
+    log.info("Waiting for browser extension to connect...")
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")

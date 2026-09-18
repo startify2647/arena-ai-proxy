@@ -267,7 +267,7 @@ arena2api/
 | در Console `models: 0` | ساختار سایت دوباره عوض شده | وصله نیاز به به‌روزرسانی دارد — گزارش دهید |
 | `503 No reCAPTCHA token available` | افزونه توکن نمی‌سازد | Console تب arena.ai را ببینید؛ باید `Got V3 token` چاپ شود. AdBlock/Shields را برای arena.ai خاموش کنید |
 | **(Firefox)** `Permission denied to access object` + `Injector timeout` | نسخه‌ی قدیمی افزونه (< 2.0.2) | افزونه را به‌روز و در `about:debugging` ریلود کنید، تب را دوباره باز کنید |
-| `403 Attention Required! Cloudflare` | درخواست بدون توکن، یا UA/کوکی ناهماهنگ | ابتدا توکن‌ها را درست کنید؛ سرور از نسخه‌ی 2.0.2 به بعد UA مرورگر را خودکار کپی می‌کند |
+| `403 Attention Required! Cloudflare` | Cloudflare اثر انگشت TLS پایتون را می‌شناسد | `pip install curl_cffi` (در requirements هست) و سرور را ری‌استارت کنید؛ سرور با TLS شبیه مرورگر شما درخواست می‌زند. در لاگ استارت باید `TLS impersonation: ON` ببینید |
 
 **بررسی سریع وضعیت سرور:**
 ```bash
