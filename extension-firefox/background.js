@@ -106,7 +106,10 @@
   }
 
   // ========== درخواست توکن از content script ==========
-  async function requestToken() {
+  // action می‌تواند 'chat_submit' (حالت مستقیم) یا
+  // 'agentic_chat_submit' (حالت ایجنت) باشد.
+  async function requestToken(action) {
+    action = action || 'chat_submit';
     if (!state.tabId) {
       try {
         var tabs = await api.tabs.query({ url: 'https://arena.ai/*' });
@@ -117,7 +120,7 @@
     try {
       api.tabs.sendMessage(state.tabId, {
         type: 'NEED_TOKEN',
-        action: 'chat_submit',
+        action: action,
       }, function(resp) {
         if (api.runtime.lastError) {
           state.tabId = null;
@@ -167,7 +170,10 @@
         state.lastPush = Date.now();
         var result = await resp.json();
         if (result.need_tokens) {
-          requestToken();
+          requestToken('chat_submit');
+        }
+        if (result.need_agent_tokens) {
+          setTimeout(function() { requestToken('agentic_chat_submit'); }, 1500);
         }
       } else {
         state.connected = false;
@@ -262,11 +268,21 @@
     }
   });
 
+  // تعداد توکن‌های سالم هر action
+  function countAction(action) {
+    return state.v3Tokens.filter(function(t) { return t.action === action; }).length;
+  }
+
   // ========== کارهای زمان‌بندی‌شده ==========
+  // دو استخر جدا: chat_submit برای حالت مستقیم، agentic_chat_submit برای حالت ایجنت
   setInterval(function() {
     cleanTokens();
-    if (state.v3Tokens.length < 5) {
-      requestToken();
+    if (countAction('chat_submit') < 3) {
+      requestToken('chat_submit');
+    }
+    if (countAction('agentic_chat_submit') < 2) {
+      // کمی تأخیر تا دو فراخوان reCAPTCHA پشت‌سرهم تداخل نکنند
+      setTimeout(function() { requestToken('agentic_chat_submit'); }, 2000);
     }
   }, 80000);
 

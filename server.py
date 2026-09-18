@@ -46,6 +46,17 @@ ARENA_BASE = "https://arena.ai"
 ARENA_CREATE_EVAL = f"{ARENA_BASE}/nextjs-api/stream/create-evaluation"
 ARENA_POST_EVAL = f"{ARENA_BASE}/nextjs-api/stream/post-to-evaluation"  # + /{id}
 
+# Agent Mode endpoints (reverse-engineered from arena.ai web bundles)
+ARENA_CREATE_CHAT = f"{ARENA_BASE}/nextjs-api/stream/create-chat"
+ARENA_TRIGGER_SESSION = f"{ARENA_BASE}/api/chat/trigger-session"
+ARENA_REALTIME = f"{ARENA_BASE}/ai-proxy/realtime/v1/sessions"  # + /{sid}/in/append | /{sid}/out
+
+# Agent behaviour tuning
+AGENT_REPLAY_MAX = int(os.environ.get("AGENT_REPLAY_MAX", "3"))      # حداکثر پیام تاریخچه که «زنده» بازپخش می‌شود
+AGENT_SESSION_TTL = float(os.environ.get("AGENT_SESSION_TTL", "1800"))  # عمر کش گفتگو (ثانیه)
+AGENT_TURN_TIMEOUT = float(os.environ.get("AGENT_TURN_TIMEOUT", "600"))  # مهلت کامل یک نوبت ایجنت
+AGENT_STALL_TIMEOUT = float(os.environ.get("AGENT_STALL_TIMEOUT", "120"))  # مهلت سکون استریم
+
 # reCAPTCHA
 RECAPTCHA_V3_SITEKEY = "6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I"
 
@@ -145,12 +156,25 @@ class Store:
             if "image" in in_caps:
                 self.vision_models.append(name)
 
-    def pop_v3_token(self) -> Optional[str]:
+    def pop_v3_token(self, action: Optional[str] = None, strict: bool = False) -> Optional[str]:
+        """برداشتن یک توکن V3. اگر action داده شود، توکن با همان action ترجیح دارد.
+        با strict=True فقط همان action قبول می‌شود (برای agentic_chat_submit لازم است)."""
         now = time.time()
         self.v3_tokens = [t for t in self.v3_tokens if now - t["ts"] < 120]
         if not self.v3_tokens:
             return None
+        if action:
+            for i, t in enumerate(self.v3_tokens):
+                if t["action"] == action:
+                    return self.v3_tokens.pop(i)["token"]
+            if strict:
+                return None
         return self.v3_tokens.pop(0)["token"]
+
+    def count_v3(self, action: Optional[str] = None) -> int:
+        now = time.time()
+        return len([t for t in self.v3_tokens
+                    if now - t["ts"] < 120 and (action is None or t["action"] == action)])
 
     def pop_v2_token(self) -> Optional[str]:
         if not self.v2_token:
@@ -175,6 +199,8 @@ class Store:
             "active": self.active,
             "last_push_ago": round(now - self.last_push, 1) if self.last_push else None,
             "v3_tokens": len(valid_v3),
+            "v3_chat_tokens": len([t for t in valid_v3 if t["action"] == "chat_submit"]),
+            "v3_agent_tokens": len([t for t in valid_v3 if t["action"] == "agentic_chat_submit"]),
             "has_v2": bool(self.v2_token and now - self.v2_token["ts"] < 120),
             "has_auth": bool(self.auth_token),
             "has_cf": bool(self.cf_clearance),
@@ -186,6 +212,483 @@ class Store:
 
 
 store = Store()
+
+# ============================================================
+# Agent Mode — گفتگوهای چندنوبتی با یک reCAPTCHA برای کل مکالمه
+# ============================================================
+# پروتکل (بازیابی‌شده از باندل‌های وب arena.ai):
+#   1) پیام اول:   POST /nextjs-api/stream/create-chat
+#                  (نیازمند توکن reCAPTCHA با action=agentic_chat_submit)
+#   2) شروع سشن:   POST /api/chat/trigger-session {sessionId, timezone}
+#                  → {publicAccessToken}
+#   3) پیام بعدی:  POST /ai-proxy/realtime/v1/sessions/{sid}/in/append
+#                  (با Bearer=publicAccessToken — بدون reCAPTCHA)
+#   4) خواندن پاسخ: GET /ai-proxy/realtime/v1/sessions/{sid}/out  (SSE)
+#                  پایان نوبت: chunk.type == "trigger:turn-complete"
+# ============================================================
+
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+class AgentError(Exception):
+    """خطای سمت arena.ai در زنجیره‌ی ایجنت"""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+class AgentConversation:
+    """یک گفتگوی ایجنت که روی arena.ai زنده است"""
+    __slots__ = ("session_id", "pat", "turns", "created", "touched",
+                 "model_id", "lock", "last_reply")
+
+    def __init__(self, session_id: str, pat: str, model_id: Optional[str]):
+        self.session_id = session_id
+        self.pat = pat                       # publicAccessToken سشن (trigger.dev)
+        self.turns: list = []                # متن پیام‌های user که «مصرف» شده‌اند
+        self.created = time.time()
+        self.touched = time.time()
+        self.model_id = model_id
+        self.lock = asyncio.Lock()
+        self.last_reply: str = ""            # برای پاسخ به درخواست‌های تکراری بدون هزینه
+
+
+class AgentManager:
+    """کش گفتگوها — تطبیق پیشوند تاریخچه برای استفاده‌ی مجدد از سشن"""
+
+    def __init__(self):
+        self.conversations: list = []
+
+    def gc(self):
+        now = time.time()
+        self.conversations = [c for c in self.conversations
+                              if now - c.touched < AGENT_SESSION_TTL]
+
+    def find(self, turns: list) -> Optional[AgentConversation]:
+        """گفتگویی با طولانی‌ترین turn-های سازگار با پیشوند turns"""
+        self.gc()
+        best = None
+        for c in self.conversations:
+            n = len(c.turns)
+            if n == 0 or n > len(turns):
+                continue
+            if c.turns == turns[:n]:
+                if best is None or n > len(best.turns):
+                    best = c
+        return best
+
+    def add(self, conv: AgentConversation):
+        self.gc()
+        self.conversations.append(conv)
+
+    def drop(self, conv: AgentConversation):
+        if conv in self.conversations:
+            self.conversations.remove(conv)
+
+
+agent_mgr = AgentManager()
+
+
+def _msg_text(content) -> str:
+    """استخراج متن از content رشته‌ای یا لیست پارت‌های OpenAI"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [p.get("text", "") for p in content
+                 if isinstance(p, dict) and p.get("type") == "text"]
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+def build_agent_turns(messages: list) -> list:
+    """تبدیل تاریخچه‌ی OpenAI به دنباله‌ی متن‌های user برای ایجنت.
+
+    پیام‌های system در اولین پیام user ادغام می‌شوند؛
+    پیام‌های assistant نادیده گرفته می‌شوند (arena آن‌ها را سمت سرور دارد).
+    """
+    system_texts, user_texts = [], []
+    for m in messages:
+        role = m.get("role", "")
+        text = _msg_text(m.get("content", ""))
+        if not text.strip():
+            continue
+        if role == "system":
+            system_texts.append(text)
+        elif role == "user":
+            user_texts.append(text)
+    if not user_texts:
+        raise HTTPException(400, "messages must contain at least one user message")
+    if system_texts:
+        user_texts[0] = "\n\n".join(system_texts) + "\n\n" + user_texts[0]
+    return user_texts
+
+
+def _agent_headers(sid: Optional[str] = None, pat: Optional[str] = None,
+                   sse: bool = False) -> dict:
+    h = {
+        "origin": ARENA_BASE,
+        "referer": f"{ARENA_BASE}/agent/{sid}" if sid else f"{ARENA_BASE}/",
+        "user-agent": USER_AGENT,
+        "cookie": store.build_cookie_header(),
+    }
+    if sse:
+        h["accept"] = "text/event-stream"
+    else:
+        h["accept"] = "*/*"
+        h["content-type"] = "application/json"
+    if pat:
+        h["authorization"] = f"Bearer {pat}"
+    return h
+
+
+def _extract_session_id(text: str, our_msg_id: str) -> Optional[str]:
+    """session id را از پاسخ create-chat استخراج می‌کند (JSON یا خام)"""
+    try:
+        j = json.loads(text)
+        if isinstance(j, dict):
+            for key in ("id", "sessionId", "chatId"):
+                if isinstance(j.get(key), str) and _UUID_RE.fullmatch(j[key]):
+                    return j[key]
+    except Exception:
+        pass
+    for m in _UUID_RE.finditer(text):
+        if m.group(0).lower() != our_msg_id.lower():
+            return m.group(0)
+    return None
+
+
+async def agent_recreate(client: httpx.AsyncClient, conv: AgentConversation):
+    """گرفتن publicAccessToken تازه (بدون reCAPTCHA)"""
+    r = await client.post(ARENA_TRIGGER_SESSION,
+                          json={"sessionId": conv.session_id, "timezone": "UTC"},
+                          headers=_agent_headers(conv.session_id))
+    if r.status_code != 200:
+        raise AgentError(r.status_code, f"trigger-session failed: {r.text[:300]}")
+    try:
+        j = json.loads(r.text)
+    except Exception:
+        raise AgentError(502, f"trigger-session: invalid JSON: {r.text[:200]}")
+    pat = j.get("publicAccessToken") or j.get("token")
+    if not pat:
+        raise AgentError(502, f"trigger-session: no token in response: {r.text[:200]}")
+    conv.pat = pat
+
+
+async def agent_create(client: httpx.AsyncClient, seed_text: str,
+                       model_id: Optional[str], v3_token: Optional[str],
+                       v2_token: Optional[str]) -> AgentConversation:
+    """ایجاد گفتگوی جدید با پیام اول (اینجاست که reCAPTCHA مصرف می‌شود)"""
+    msg_id = uuid7()
+    payload = {
+        "message": {"id": msg_id, "role": "user",
+                    "parts": [{"type": "text", "text": seed_text}]},
+        "timezone": "UTC",
+    }
+    if v2_token:
+        payload["recaptchaV2Token"] = v2_token
+        payload["recaptchaV3Token"] = None
+    else:
+        payload["recaptchaV3Token"] = v3_token
+    if model_id:
+        payload["modelId"] = model_id
+
+    r = await client.post(ARENA_CREATE_CHAT, json=payload, headers=_agent_headers())
+    if r.status_code != 200:
+        raise AgentError(r.status_code, f"create-chat failed: {r.text[:300]}")
+    sid = _extract_session_id(r.text, msg_id)
+    if not sid:
+        raise AgentError(502, f"create-chat: session id not found: {r.text[:300]}")
+
+    conv = AgentConversation(sid, "", model_id)
+    await agent_recreate(client, conv)   # publicAccessToken اولیه
+    log.info(f"[agent] conversation created: {sid} (model={model_id or 'default'})")
+    return conv
+
+
+async def agent_append(client: httpx.AsyncClient, conv: AgentConversation, text: str):
+    """ارسال پیام user بعدی روی همان سشن — بدون reCAPTCHA"""
+    msg_id = uuid7()
+    chunk = {
+        "kind": "message",
+        "payload": {
+            "message": {"id": msg_id, "role": "user",
+                        "parts": [{"type": "text", "text": text}]},
+            "chatId": conv.session_id,
+            "trigger": "submit-message",
+            "messageId": msg_id,
+            "metadata": {"originHost": "arena.ai", "timezone": "UTC"},
+        },
+    }
+    url = f"{ARENA_REALTIME}/{conv.session_id}/in/append"
+    for attempt in range(2):
+        h = _agent_headers(conv.session_id, pat=conv.pat)
+        h["x-trigger-source"] = "sdk"
+        h["X-Part-Id"] = str(uuid.uuid4())
+        r = await client.post(url, json=chunk, headers=h)
+        if r.status_code == 200:
+            return
+        if r.status_code in (401, 403, 404) and attempt == 0:
+            log.info(f"[agent] append got {r.status_code}, recreating session token")
+            await agent_recreate(client, conv)
+            continue
+        raise AgentError(r.status_code, f"append failed: {r.text[:300]}")
+
+
+async def agent_read_turn(client: httpx.AsyncClient, conv: AgentConversation,
+                          on_delta=None) -> str:
+    """خواندن پاسخ نوبت فعلی از استریم SSE تا رسیدن trigger:turn-complete.
+
+    on_delta(str) برای هر تکه‌ی متن (فقط در صورت داده شدن) صدا زده می‌شود.
+    متن کامل این نوبت بازگردانده می‌شود.
+    """
+    url = f"{ARENA_REALTIME}/{conv.session_id}/out"
+    deadline = time.time() + AGENT_TURN_TIMEOUT
+    parts: list = []
+    headers = _agent_headers(conv.session_id, pat=conv.pat, sse=True)
+    timeout = httpx.Timeout(connect=30.0, read=AGENT_STALL_TIMEOUT,
+                            write=60.0, pool=60.0)
+
+    for attempt in range(2):
+        data_lines: list = []
+        try:
+            async with client.stream("GET", url, headers=headers, timeout=timeout) as resp:
+                if resp.status_code != 200:
+                    body = (await resp.aread()).decode("utf-8", "replace")[:300]
+                    if resp.status_code in (401, 403, 404) and attempt == 0:
+                        log.info(f"[agent] out-stream got {resp.status_code}, recreating token")
+                        await agent_recreate(client, conv)
+                        headers = _agent_headers(conv.session_id, pat=conv.pat, sse=True)
+                        continue
+                    raise AgentError(resp.status_code, f"out-stream failed: {body}")
+
+                async for line in resp.aiter_lines():
+                    if time.time() > deadline:
+                        raise AgentError(504, "agent turn overall timeout")
+                    if line.startswith(":"):
+                        continue                      # کامنت/keep-alive
+                    if line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip())
+                        continue
+                    if line.strip() == "":
+                        if not data_lines:
+                            continue                  # پایان ایونت بدون data
+                        raw = "\n".join(data_lines)
+                        data_lines = []
+                        try:
+                            ev = json.loads(raw)
+                        except Exception:
+                            continue
+                        if not isinstance(ev, dict):
+                            continue
+                        # چرخش توکن در بعضی ایونت‌ها
+                        evh = ev.get("headers")
+                        if isinstance(evh, dict):
+                            newpat = evh.get("public-access-token")
+                            if isinstance(newpat, str) and newpat:
+                                conv.pat = newpat
+                        chunk = ev.get("chunk")
+                        if not isinstance(chunk, dict):
+                            chunk = ev if isinstance(ev.get("type"), str) else None
+                        if not isinstance(chunk, dict):
+                            continue
+                        ctype = chunk.get("type")
+                        if ctype == "trigger:turn-complete":
+                            return "".join(parts)
+                        if isinstance(ctype, str) and ctype.startswith("trigger:"):
+                            continue                  # رویدادهای داخلی trigger.dev
+                        if ctype == "error":
+                            raise AgentError(502, f"stream error: {str(chunk)[:300]}")
+                        if ctype == "text-delta":
+                            d = (chunk.get("delta") or chunk.get("textDelta")
+                                 or chunk.get("text") or "")
+                            if d:
+                                parts.append(d)
+                                if on_delta:
+                                    on_delta(d)
+        except AgentError:
+            raise
+    raise AgentError(502, "out-stream: exhausted retries")
+
+
+async def _agent_flow(model_name: str, messages: list, on_delta=None) -> str:
+    """جریان کامل یک درخواست ایجنت؛ متن پاسخ نهایی را برمی‌گرداند."""
+    turns = build_agent_turns(messages)
+    conv = agent_mgr.find(turns)
+    timeout = httpx.Timeout(connect=30.0, read=AGENT_STALL_TIMEOUT,
+                            write=60.0, pool=60.0)
+
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        if conv is not None:
+            # سریال‌سازی دسترسی به سشن مشترک
+            await conv.lock.acquire()
+        try:
+            pending_seed = False
+            if conv is None:
+                hint = model_name.split(":", 1)[1].strip() if ":" in model_name else ""
+                model_id = None
+                if hint:
+                    model_id = store.text_models.get(hint)
+                    if not model_id:
+                        for n, mid in store.text_models.items():
+                            if hint.lower() in n.lower() or n.lower() in hint.lower():
+                                model_id = mid
+                                log.info(f"[agent] model hint '{hint}' → '{n}'")
+                                break
+                    if not model_id:
+                        log.warning(f"[agent] model hint '{hint}' not found; using arena default")
+                v3 = store.pop_v3_token("agentic_chat_submit", strict=True)
+                v2 = store.pop_v2_token() if not v3 else None
+                if not v3 and not v2:
+                    raise HTTPException(
+                        503,
+                        "Agent mode needs an 'agentic_chat_submit' reCAPTCHA token. "
+                        "Keep the arena.ai tab open and retry in a few seconds.")
+                try:
+                    if len(turns) > AGENT_REPLAY_MAX + 1:
+                        # تاریخچه‌ی طولانی: همه به‌جز آخری را به‌صورت رونوشت یک‌جا بفرست
+                        seed = "\n\n".join(f"<|user|>\n{t}" for t in turns[:-1])
+                        conv = await agent_create(client, seed, model_id, v3, v2)
+                        conv.turns = list(turns[:-1])
+                    else:
+                        conv = await agent_create(client, turns[0], model_id, v3, v2)
+                        conv.turns = list(turns[:1])
+                except AgentError as e:
+                    log.error(f"[agent] create failed: {e.status} {e.message}")
+                    raise HTTPException(502, f"Agent create error ({e.status}): {e.message}")
+                agent_mgr.add(conv)
+                await conv.lock.acquire()
+                pending_seed = True
+
+            remaining = turns[len(conv.turns):]
+
+            if not remaining and not pending_seed:
+                # تاریخچه‌ی تکراری — بدون هزینه از کش پاسخ می‌دهیم
+                if conv.last_reply:
+                    log.info(f"[agent] identical history; serving cached reply ({conv.session_id})")
+                    if on_delta:
+                        on_delta(conv.last_reply)
+                    return conv.last_reply
+                raise HTTPException(
+                    409, "This exact conversation was already completed and no reply "
+                         "is cached. Send a new message to continue.")
+
+            try:
+                # نوبت seed (پیام اول) از قبل در صف است؛ فقط باید خوانده شود
+                if pending_seed:
+                    emit = on_delta if not remaining else None
+                    seed_reply = await agent_read_turn(client, conv, emit)
+                    conv.last_reply = seed_reply
+                    conv.touched = time.time()
+                    if not remaining:
+                        return seed_reply
+
+                # واحدهای ارسالی: (متن روی سیم، تعداد turn منطقی مصرف‌شده)
+                if len(remaining) > AGENT_REPLAY_MAX and len(remaining) > 1:
+                    merged = "\n\n".join(f"<|user|>\n{t}" for t in remaining[:-1])
+                    units = [(merged, len(remaining) - 1), (remaining[-1], 1)]
+                else:
+                    units = [(t, 1) for t in remaining]
+
+                reply = ""
+                for i, (text, count) in enumerate(units):
+                    emit = on_delta if i == len(units) - 1 else None
+                    await agent_append(client, conv, text)
+                    reply = await agent_read_turn(client, conv, emit)
+                    conv.turns = list(turns[:len(conv.turns) + count])
+                    conv.touched = time.time()
+                conv.last_reply = reply
+                log.info(f"[agent] turn done on {conv.session_id}: "
+                         f"{len(reply)} chars, turns consumed: {len(conv.turns)}")
+                return reply
+            except AgentError as e:
+                # سشن خراب/منقضی → از کش حذفش کن تا دفعه‌ی بعد تازه ساخته شود
+                log.error(f"[agent] conversation {conv.session_id} failed: {e.status} {e.message}")
+                agent_mgr.drop(conv)
+                raise HTTPException(502, f"Agent error ({e.status}): {e.message}")
+        finally:
+            if conv is not None and conv.lock.locked():
+                conv.lock.release()
+
+
+def _openai_chunk(chat_id: str, created: int, model: str,
+                  delta: dict, finish: Optional[str] = None) -> str:
+    return "data: " + json.dumps({
+        "id": chat_id, "object": "chat.completion.chunk", "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+    }) + "\n\n"
+
+
+async def _agent_stream_gen(model_name: str, messages: list, on_delta_unused=None):
+    """ژنراتور SSE خروجی OpenAI برای حالت ایجنت"""
+    chat_id = f"chatcmpl-{uuid7()}"
+    created = int(time.time())
+    q: asyncio.Queue = asyncio.Queue()
+    SENTINEL = object()
+
+    async def runner():
+        err = None
+        try:
+            await _agent_flow(model_name, messages,
+                              on_delta=lambda d: q.put_nowait(("delta", d)))
+        except HTTPException as e:
+            err = f"[Error {e.status_code}] {e.detail}"
+        except Exception as e:  # noqa: BLE001
+            log.exception("[agent] stream runner failed")
+            err = f"[Agent error] {e}"
+        await q.put(("error", err) if err else ("done", SENTINEL))
+
+    task = asyncio.create_task(runner())
+    yield _openai_chunk(chat_id, created, model_name, {"role": "assistant"})
+    try:
+        while True:
+            kind, payload = await q.get()
+            if kind == "delta":
+                yield _openai_chunk(chat_id, created, model_name, {"content": payload})
+            elif kind == "error":
+                yield _openai_chunk(chat_id, created, model_name,
+                                    {"content": payload}, finish="stop")
+                break
+            else:
+                yield _openai_chunk(chat_id, created, model_name, {}, finish="stop")
+                break
+    finally:
+        if not task.done():
+            task.cancel()
+    yield "data: [DONE]\n\n"
+
+
+async def agent_chat_completions(model_name: str, messages: list,
+                                 stream: bool, client_type: str):
+    """نقطه‌ی ورود Agent Mode از /v1/chat/completions"""
+    if stream:
+        return StreamingResponse(
+            _agent_stream_gen(model_name, messages),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
+                     "X-Accel-Buffering": "no"},
+        )
+    parts: list = []
+    text = await _agent_flow(model_name, messages, on_delta=parts.append)
+    full = text or "".join(parts)
+    now = int(time.time())
+    return JSONResponse({
+        "id": f"chatcmpl-{uuid7()}",
+        "object": "chat.completion",
+        "created": now,
+        "model": model_name,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": full},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    })
 
 # ============================================================
 # FastAPI
@@ -224,17 +727,22 @@ async def extension_push(request: Request):
     except Exception:
         raise HTTPException(400, "Invalid JSON")
     store.push(data)
-    need = len([t for t in store.v3_tokens if time.time() - t["ts"] < 120]) < 3
+    need = store.count_v3("chat_submit") < 3
+    need_agent = store.count_v3("agentic_chat_submit") < 2
     return {
         "status": "ok",
         "need_tokens": need,
+        "need_agent_tokens": need_agent,
         "v3_count": len(store.v3_tokens),
     }
 
 
 @app.get("/v1/extension/status")
 async def extension_status():
-    return store.status()
+    s = store.status()
+    agent_mgr.gc()
+    s["agent_conversations"] = len(agent_mgr.conversations)
+    return s
 
 
 # ============================================================
@@ -248,6 +756,14 @@ async def list_models(request: Request):
     all_models.update(store.text_models)
     all_models.update(store.image_models)
     data = []
+    # مدل مجازی Agent Mode — گفتگوی چندنوبتی: یک reCAPTCHA برای اولین پیام،
+    # پیام‌های بعدی روی همان سشن بدون توکن جدید
+    data.append({
+        "id": "agent",
+        "object": "model",
+        "created": 0,
+        "owned_by": "arena.ai",
+    })
     for name in sorted(all_models.keys()):
         data.append({
             "id": name,
@@ -302,6 +818,12 @@ async def chat_completions(request: Request):
     if not store.active:
         raise HTTPException(503, "Extension not connected. Please open arena.ai in Chrome with the extension installed.")
 
+    # ---------- Agent Mode ----------
+    # مدل «agent» یا «agent:<modelName>» → گفتگوی چندنوبتی با یک reCAPTCHA برای کل مکالمه
+    if model_name == "agent" or model_name.startswith("agent:"):
+        log.info(f"[agent] request: model={model_name}, messages={len(messages)}, stream={stream}")
+        return await agent_chat_completions(model_name, messages, stream, client_type)
+
     # 解析模型
     model_id = store.text_models.get(model_name) or store.image_models.get(model_name)
     if not model_id:
@@ -348,8 +870,8 @@ async def chat_completions(request: Request):
             history_parts.append(f"<|{role}|>\n{content}")
         prompt = "\n".join(history_parts)
 
-    # 获取 reCAPTCHA token
-    v3_token = store.pop_v3_token()
+    # 获取 reCAPTCHA token（ ترجیح با action=chat_submit ）
+    v3_token = store.pop_v3_token(action="chat_submit")
     v2_token = store.pop_v2_token() if not v3_token else None
 
     is_image = model_name in store.image_models
