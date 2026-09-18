@@ -74,8 +74,10 @@ python server.py
 2. «Developer mode» را روشن کنید
 3. «Load unpacked» را بزنید و پوشه‌ی `arena-ai-proxy/extension/` را انتخاب کنید
 
-**فایرفاکس:** به `about:debugging#/runtime/this-firefox` بروید → «Load Temporary Add-on» → فایل `extension/manifest.json`
-(توجه: در فایرفاکس ممکن است لازم باشد `manifest.json` را به نسخه‌ی V2 تبدیل کنید؛ نسخه‌ی کروم MV3 در فایرفاکس‌های جدید هم کار می‌کند)
+**فایرفاکس:** نسخه‌ی مخصوص فایرفاکس (Manifest V2) در پوشه‌ی `extension-firefox/` قرار دارد:
+1. به `about:debugging#/runtime/this-firefox` بروید
+2. «Load Temporary Add-on...» را بزنید و فایل `extension-firefox/manifest.json` را انتخاب کنید
+(توجه: این روش موقت است و با بستن فایرفاکس افزونه پاک می‌شود؛ برای نصب دائمی باید افزونه را امضا (sign) کنید)
 
 ### ۳) اتصال به arena.ai
 
@@ -173,12 +175,19 @@ arena2api/
 ├── requirements.txt
 ├── start.sh             # راه‌انداز لینوکس (venv خودکار)
 ├── README.md
-└── extension/           # افزونه‌ی کروم (Manifest V3)
+├── extension/           # افزونه‌ی کروم/Edge/Brave (Manifest V3)
+│   ├── manifest.json
+│   ├── background.js    # Service Worker — استخر توکن، تازه‌سازی، push دوره‌ای
+│   ├── content.js       # پل پیام (ISOLATED world)
+│   ├── injector.js      # v2 اصلاح‌شده — استخراج مدل از RSC فعلی سایت + reCAPTCHA
+│   ├── popup.html/js    # رابط وضعیت
+│   └── icons/
+└── extension-firefox/   # افزونه‌ی فایرفاکس (Manifest V2)
     ├── manifest.json
-    ├── background.js    # Service Worker — استخر توکن، تازه‌سازی، push دوره‌ای
-    ├── content.js       # پل پیام (ISOLATED world)
-    ├── injector.js      # v2 اصلاح‌شده — استخراج مدل از RSC فعلی سایت + reCAPTCHA
-    ├── popup.html/js    # رابط وضعیت
+    ├── background.js    # Background Script — نسخه‌ی browser.* API
+    ├── content.js       # پل پیام
+    ├── injector.js      # v2 اصلاح‌شده + دسترسی wrappedJSObject برای Xray فایرفاکس
+    ├── popup.html/js
     └── icons/
 ```
 
