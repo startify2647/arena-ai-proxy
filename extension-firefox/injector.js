@@ -184,11 +184,38 @@
         return;
       }
 
-      g.ready(function() {
-        g.execute(SITEKEY, { action: action || 'chat_submit' })
-          .then(resolve)
-          .catch(reject);
-      });
+      var act = action || 'chat_submit';
+      var done = false;
+      function ok(t)  { if (!done) { done = true; resolve(t); } }
+      function bad(e) { if (!done) { done = true; reject(e instanceof Error ? e : new Error(String(e))); } }
+
+      // [FIREFOX] هر تابع/آبجکتی که به کد صفحه پاس می‌دهیم باید با
+      // exportFunction / cloneInto صادر شود؛ وگرنه صفحه هنگام صدا زدن آن
+      // خطای «Permission denied to access object» می‌گیرد و callback هرگز اجرا نمی‌شود.
+      var isXray = (typeof exportFunction === 'function' && typeof cloneInto === 'function' && PW !== window);
+
+      function runExecute() {
+        try {
+          var opts = isXray ? cloneInto({ action: act }, PW) : { action: act };
+          var p = g.execute(SITEKEY, opts);
+          if (isXray) {
+            p.then(exportFunction(ok, PW), exportFunction(bad, PW));
+          } else {
+            p.then(ok, bad);
+          }
+        } catch (e) { bad(e); }
+      }
+
+      try {
+        if (typeof g.ready === 'function') {
+          g.ready(isXray ? exportFunction(runExecute, PW) : runExecute);
+        } else {
+          runExecute();
+        }
+      } catch (e) { bad(e); }
+
+      // مهلت ایمنی: اگر ready هیچ‌وقت صدا نزد
+      setTimeout(function() { bad(new Error('recaptcha execute timeout')); }, 15000);
     });
   }
 
